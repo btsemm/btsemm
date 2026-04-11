@@ -1,0 +1,6 @@
+.env
+*.log
+/bot
+/wslisten
+/orders
+/cmd/bot/bot
