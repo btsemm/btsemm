@@ -5,7 +5,7 @@ Go package for the BTSE Spot Exchange API v3.3.
 ## Setup
 
 ```bash
-go get codeberg.org/btsemm/btsemm
+git clone https://codeberg.org/btsemm/btsemm
 ```
 
 Create a `.env` file (make sure it's in `.gitignore`):
