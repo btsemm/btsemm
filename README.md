@@ -15,6 +15,11 @@ export BTSE_API_KEY="your-api-key"
 export BTSE_API_SECRET="your-api-secret"
 ```
 
+
+## Bot
+
+If you came here for the bot then go see [cmd/bot/README.md](cmd/bot/README.md) |
+
 ## Client
 
 ```go
