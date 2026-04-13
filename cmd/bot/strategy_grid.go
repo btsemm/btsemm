@@ -33,16 +33,16 @@ const (
 )
 
 type gridStrategy struct {
-	mu           sync.Mutex
-	grids        int
-	low          float64
-	high         float64
-	investment   float64
-	levels       []float64   // grids+1 price levels
-	state        []gridState // grids entries: buy or sell per gap
-	ratio        float64
-	sizePerGrid  float64 // USDT per grid
-	makerFeePct  float64 // actual maker fee from exchange
+	mu          sync.Mutex
+	grids       int
+	low         float64
+	high        float64
+	investment  float64
+	levels      []float64   // grids+1 price levels
+	state       []gridState // grids entries: buy or sell per gap
+	ratio       float64
+	sizePerGrid float64 // USDT per grid
+	makerFeePct float64 // actual maker fee from exchange
 }
 
 func newGrid() btsemm.Strategy {
@@ -264,7 +264,8 @@ func (s *gridStrategy) OnFill(fill btsemm.WSFill) {
 				s.state[i] = gridBuy
 				profit := (s.levels[i+1]/s.levels[i] - 1) * 100
 				netProfit := profit - s.makerFeePct*2
-				log.Printf("grid: [%2d] FILLED SELL @ %.6f → now BUY @ %.6f (net profit %.4f%%)", i, fill.Price, s.levels[i], netProfit)
+				netProfitUSDT := s.sizePerGrid * netProfit / 100
+				log.Printf("grid: [%2d] FILLED SELL @ %.6f → now BUY @ %.6f (net profit %.4f%% / $%.4f)", i, fill.Price, s.levels[i], netProfit, netProfitUSDT)
 				return
 			}
 		}
