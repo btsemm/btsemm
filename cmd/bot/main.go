@@ -60,13 +60,13 @@ var FullVersion = func() string {
 // Global flags
 var (
 	// Engine
-	flagSymbol    = flag.String("symbol", "BTC-USDT", "trading pair")
-	flagStrategy  = flag.String("strategy", "simple", "strategy name: "+availableStrategies())
-	flagTick      = flag.Duration("tick", 1*time.Second, "tick interval")
-	flagReconcile = flag.Duration("reconcile", 30*time.Second, "reconcile interval")
-	flagDeadMan   = flag.Int64("deadman", 30000, "dead man's switch timeout in ms (0=off)")
-	flagMaxErrors = flag.Int("max-errors", 5, "kill after N consecutive order errors")
-	flagAmendBPS  = flag.Float64("amend-bps", 1, "min price move to replace orders, in basis points of order price (1 = 0.01%)")
+	flagSymbol      = flag.String("symbol", "BTC-USDT", "trading pair")
+	flagStrategy    = flag.String("strategy", "simple", "strategy name: "+availableStrategies())
+	flagTick        = flag.Duration("tick", 1*time.Second, "tick interval")
+	flagReconcile   = flag.Duration("reconcile", 30*time.Second, "reconcile interval")
+	flagDeadMan     = flag.Int64("deadman", 30000, "dead man's switch timeout in ms (0=off)")
+	flagMaxErrors   = flag.Int("max-errors", 5, "kill after N consecutive order errors")
+	flagAmendBPS    = flag.Float64("amend-bps", 1, "min price move to replace orders, in basis points of order price (1 = 0.01%)")
 	flagTestnet     = flag.Bool("testnet", false, "use BTSE testnet")
 	flagVersion     = flag.Bool("version", false, "print short version and exit")
 	flagFullVersion = flag.Bool("fullversion", false, "print full version and exit")
@@ -135,6 +135,11 @@ func main() {
 		}
 	}
 	client := btsemm.NewFromEnv(opts...)
+
+	if client.IsEmptyAuthentication() {
+		fmt.Println("Please set your API keys in the .env file")
+		os.Exit(1)
+	}
 
 	config := btsemm.EngineConfig{
 		Symbol:            *flagSymbol,

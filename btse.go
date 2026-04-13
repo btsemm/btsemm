@@ -63,9 +63,9 @@ func NewFromEnv(opts ...Option) *Client {
 // public-only endpoints.
 func New(apiKey, apiSecret string, opts ...Option) *Client {
 	c := &Client{
-		baseURL:   ProdBaseURL,
-		apiKey:    apiKey,
-		apiSecret: apiSecret,
+		baseURL:    ProdBaseURL,
+		apiKey:     apiKey,
+		apiSecret:  apiSecret,
 		httpClient: newHTTPClient(),
 	}
 	for _, o := range opts {
@@ -253,4 +253,11 @@ func newHTTPClient() *http.Client {
 		Transport: transport,
 		Timeout:   10 * time.Second,
 	}
+}
+
+func (c *Client) IsEmptyAuthentication() bool {
+	if c.apiKey == "" || c.apiSecret == "" {
+		return true
+	}
+	return false
 }
