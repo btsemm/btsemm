@@ -226,11 +226,52 @@ For this grid, if every buy level fills on the way down, average buy price ≈ g
 
 Remember: grids are *designed* to accumulate inventory on the way down. An aggressive stop defeats the thesis; a loose one accepts holding the bag if the range breaks. This is a deliberate trade-off, not a number to optimize.
 
+### Base-currency buffer (partial-fill race)
+
+There is a benign but visible race between partial fills and reconciliation. Example timeline from a real run:
+
+```
+22:44:51.952  grid: [16] FILLED BUY @ 0.275900 → now SELL @ 0.281554   ← tiny partial triggers flip
+22:44:52.289  engine: placing SELL 22.649300 @ 0.281600
+22:44:52.609  engine: cancelling unmatched BUY ...-17 @ 0.275900
+22:44:52.905  grid: FILL BUY 21.826100 @ 0.275900 (unmatched to grid)  ← rest fills before cancel lands
+```
+
+What's happening:
+
+1. `OnFill` (`strategy_grid.go:246-274`) flips the level's state from `gridBuy` → `gridSell` on **any** fill, regardless of fill size.
+2. The next tick, `OnTick` (`strategy_grid.go:213-244`) returns a SELL for that level at the **full nominal grid size** (`sizePerGrid / level_price`). The old resting BUY at the same level is no longer in the desired set.
+3. Reconciliation (`engine.go:489-492`) cancels the "unmatched" BUY.
+
+In the log above, the tail fill raced in and completed the BUY, so everything balanced. If the cancel had won the race:
+
+- Your actual holdings from that level: the tiny partial (e.g. `0.823 JUNO`)
+- The new SELL order's size: `22.649 JUNO` (the full nominal size)
+- Deficit: up to `sizePerGrid / level_price` in base currency
+
+For this grid the worst-case single-race deficit is at the lowest level: `6.25 USDT / 0.20 = 31.25 JUNO`.
+
+**Mitigation: hold extra base currency beyond the init-check minimum.**
+
+The init log prints `sell orders N (need X JUNO)` — that's the minimum. Recommended buffer on top:
+
+| Buffer | Covers | Suggested |
+|--------|--------|-----------|
+| 1 grid (`~31 JUNO`) | one race event | Minimum; fragile |
+| **5 grids (`~156 JUNO`)** | **realistic burst on a volatile day** | **Recommended** |
+| 10+ grids (`~312 JUNO`) | sustained fill bursts | Conservative |
+
+Formula: `buffer = 5 × grid.investment / grid.grids / grid.low = 5 × 6.25 / 0.20 = 156 JUNO`.
+
+Races are uncommon (requires two fill notifications on the same resting order within ~1 tick). Five grids of headroom essentially eliminates the practical risk without any code change.
+
+This is a **mitigation**, not a fix. A proper fix would track actual filled quantity per grid level and size the replacement SELL accordingly — but that requires changes to `strategy_grid.go` we've explicitly chosen not to make.
+
 ### Pre-flight checklist
 
 1. `.env` with `BTSE_API_KEY` / `BTSE_API_SECRET` in the run directory
 2. Quote balance ≥ USDT needed for buy side (~half of `investment` if starting near the geometric mid)
-3. Base balance ≥ JUNO needed for sell side (the init log prints the exact figure)
+3. Base balance ≥ JUNO needed for sell side **plus ~5 grids' worth of buffer** (see "Base-currency buffer" above for why). The init log prints the minimum needed — add the buffer on top.
 4. Confirm `JUNO-USDT` is a live BTSE pair and the per-grid order size clears exchange minimums
 5. Consider a dry run with `-testnet` first
 
