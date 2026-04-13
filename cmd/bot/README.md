@@ -8,6 +8,17 @@ A tick-based market making bot built on the `btsemm` engine. Strategies are plug
 go build -o bot ./cmd/bot
 ```
 
+## Configuration
+
+Before running the bot, create a `.env` file in the directory you'll run it from with your BTSE API credentials:
+
+```
+BTSE_API_KEY="your-api-key"
+BTSE_API_SECRET="your-api-secret"
+```
+
+The bot loads this file automatically at startup. If the keys are missing or empty, the bot exits with `Please set your API keys in the .env file`.
+
 ## Usage
 
 ```

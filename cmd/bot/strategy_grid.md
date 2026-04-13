@@ -148,6 +148,92 @@ The grid strategy has its own risk boundaries (the price range and investment am
   -grid.grids 5 -grid.low 55000 -grid.high 85000 -grid.investment 1000
 ```
 
+## Detailed / Advanced Example
+
+A walkthrough of a wide-range grid on a cheap token, explaining how to size each risk parameter against the strategy's economics.
+
+```bash
+./bot -strategy grid -symbol JUNO-USDT \
+  -grid.low 0.20 -grid.high 1.00 -grid.grids 80 -grid.investment 500 \
+  -risk.max-pos 1000 -risk.max-orders 150 -risk.max-loss 500
+```
+
+### Grid economics
+
+| Quantity | Value |
+|----------|-------|
+| Price range | 0.20 → 1.00 (5× span) |
+| Grids | 80 |
+| Ratio per level | `(1.00 / 0.20)^(1/80) ≈ 1.0203` → ~2.03% spacing |
+| Investment / grid | `500 / 80 = 6.25 USDT` per order |
+| Gross profit per cycle | ~2.03% |
+| Round-trip fees (0.2% maker × 2) | 0.40% |
+| **Net profit per cycle** | **~1.63%** (positive → init check passes) |
+
+The smallest order size is `6.25 / 1.00 = 6.25 JUNO` at the top of the range — the init check (`cmd/bot/strategy_grid.go:203`) will reject startup if this is below BTSE's minimum for `JUNO-USDT`. If it does, either raise `-grid.investment` or lower `-grid.grids`.
+
+### Why `-risk.max-pos 1000` (2× investment)
+
+`risk.max-pos` is declared in USDT but converted to base units **once, at startup price** (`engine.go:204-205`):
+
+```
+MaxPositionSize = MaxPositionUSDT / lastPrice
+```
+
+After that, the risk check compares your live `|baseQty|` against that fixed base-unit limit (`risk.go:68`). The grid buys at levels *below* startup, and USDT at a lower price buys *more* base than the same USDT at startup price — so the base you accumulate can exceed `investment / startupPrice`.
+
+Worked example assuming startup price ≈ 0.45 (roughly the geometric mid of the range):
+
+| Setting | Base-unit cap | Notes |
+|---------|---------------|-------|
+| `max-pos 500` | ~1,111 JUNO | Minimum per docs (`>= investment`); risks silently blocking buys if price dumps |
+| `max-pos 600` | ~1,333 JUNO | 1.2× — matches the simple examples above |
+| `max-pos 1000` | ~2,222 JUNO | Current choice; generous headroom, grid can fully deploy even at the bottom |
+
+`1000` is safe and deliberately loose. The tightest "by the book" value is `~600`.
+
+### Why `-risk.max-orders 150`
+
+Needs to be at least `grids + 5 = 85` (per `strategy_grid.md` risk table). `150` leaves comfortable headroom for the brief moments during reconciliation when an old order is being cancelled and its replacement is still being placed.
+
+### Why `-risk.max-loss 500` is effectively "no stop"
+
+This is **not a stop loss** — on trip, the engine cancels open orders and exits; it does **not** market-sell your inventory (`risk.go:123-134`). You're left holding whatever base you'd accumulated.
+
+Unrealized PnL is marked against mid-price (`risk.go:76`):
+
+```
+unrealizedPnL = baseQty × midPrice − quoteSpent − totalFees
+```
+
+For this grid, if every buy level fills on the way down, average buy price ≈ geometric mean `√(0.20 × 1.00) = 0.447` and total JUNO held ≈ `500 / 0.447 ≈ 1,119`.
+
+| Mid price | Position value (USDT) | Unrealized loss | Trips `max-loss 500`? |
+|-----------|----------------------|-----------------|-----------------------|
+| 0.447 (startup) | 500 | 0 | no |
+| 0.30 | 336 | ~164 | no |
+| 0.20 (bottom of range) | 224 | ~276 | no |
+| 0.10 (below range) | 112 | ~388 | no |
+| 0.00 (total collapse) | 0 | 500 | barely |
+
+`max-loss 500` only fires near total wipeout. Pick based on intent:
+
+| Intent | Suggested `max-loss` | Roughly trips when |
+|--------|---------------------|---------------------|
+| Ride out the full range, only kill on extreme breakdown | `300` | Price drops below ~`0.20` |
+| Bail early if underwater | `100`–`150` | Price around `0.30` |
+| Never kill on PnL (current) | `500` | Only on ~total collapse |
+
+Remember: grids are *designed* to accumulate inventory on the way down. An aggressive stop defeats the thesis; a loose one accepts holding the bag if the range breaks. This is a deliberate trade-off, not a number to optimize.
+
+### Pre-flight checklist
+
+1. `.env` with `BTSE_API_KEY` / `BTSE_API_SECRET` in the run directory
+2. Quote balance ≥ USDT needed for buy side (~half of `investment` if starting near the geometric mid)
+3. Base balance ≥ JUNO needed for sell side (the init log prints the exact figure)
+4. Confirm `JUNO-USDT` is a live BTSE pair and the per-grid order size clears exchange minimums
+5. Consider a dry run with `-testnet` first
+
 ## Limitations
 
 - **No rebalancing** — if price moves outside the range, all orders are on one side and the grid stops producing profit
