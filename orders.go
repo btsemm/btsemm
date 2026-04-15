@@ -4,6 +4,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +38,15 @@ type OrderManager struct {
 	symbol string
 	prefix string // unique per bot instance
 	seq    int64
+
+	// Verbose enables verbose-gated debug logs (currently only at the end of
+	// Reconcile). Set by the engine from EngineConfig.Verbose.
+	Verbose bool
+
+	// lastPlaceTime is the time of the most recent successful Place() call.
+	// Used by the watchdog to surface "no orders placed in N minutes".
+	lastPlaceMu   sync.Mutex
+	lastPlaceTime time.Time
 }
 
 // NewOrderManager creates an order manager for the given symbol.
@@ -108,7 +120,57 @@ func (om *OrderManager) Place(side OrderSide, price, size float64, postOnly bool
 	om.orders[clID] = tracked
 	om.mu.Unlock()
 
+	om.lastPlaceMu.Lock()
+	om.lastPlaceTime = now
+	om.lastPlaceMu.Unlock()
+
 	return tracked, nil
+}
+
+// LastPlaceTime returns the time of the most recent successful Place() call,
+// or the zero time if no order has been placed yet.
+func (om *OrderManager) LastPlaceTime() time.Time {
+	om.lastPlaceMu.Lock()
+	defer om.lastPlaceMu.Unlock()
+	return om.lastPlaceTime
+}
+
+// OrderCounts returns the number of open BUY, SELL, and total tracked orders
+// in a single pass without allocating an intermediate slice.
+func (om *OrderManager) OrderCounts() (buys, sells, total int) {
+	om.mu.RLock()
+	defer om.mu.RUnlock()
+	for _, o := range om.orders {
+		if !o.IsOpen() {
+			continue
+		}
+		total++
+		if o.Side == SideBuy {
+			buys++
+		} else {
+			sells++
+		}
+	}
+	return
+}
+
+// DumpOrders writes a sorted listing of all currently open tracked orders to
+// the given writer. BUYs are printed first (ascending price), then SELLs
+// (ascending price). Each line includes side, price, size, status, age, and
+// client order ID.
+func (om *OrderManager) DumpOrders(w io.Writer) {
+	open := om.OpenOrders() // already returns copies under RLock
+	sort.Slice(open, func(i, j int) bool {
+		if open[i].Side != open[j].Side {
+			return open[i].Side == SideBuy
+		}
+		return open[i].Price < open[j].Price
+	})
+	for _, o := range open {
+		age := time.Since(o.CreatedAt).Truncate(time.Second)
+		fmt.Fprintf(w, "  %-4s %12.6f  %12.6f  status=%-2d age=%-10s %s\n",
+			o.Side, o.Price, o.Size, o.Status, age, o.ClOrderID)
+	}
 }
 
 // Amend modifies an existing order by cancelling and replacing it.
@@ -231,16 +293,20 @@ func (om *OrderManager) Reconcile() error {
 	}
 
 	om.mu.Lock()
-	defer om.mu.Unlock()
+	// Track diff for verbose logging.
+	var localOpen, removed, added int
+	now := time.Now()
 
 	// Mark locally-open orders that are gone from exchange as cancelled
 	for clID, tracked := range om.orders {
 		if !tracked.IsOpen() {
 			continue
 		}
+		localOpen++
 		if _, exists := exchangeSet[clID]; !exists {
 			tracked.Status = OrderStatusCancelled
-			tracked.UpdatedAt = time.Now()
+			tracked.UpdatedAt = now
+			removed++
 		}
 	}
 
@@ -259,9 +325,16 @@ func (om *OrderManager) Reconcile() error {
 				Size:      o.RemainingOrderBaseSize,
 				Status:    o.Status,
 				CreatedAt: time.UnixMilli(o.Timestamp),
-				UpdatedAt: time.Now(),
+				UpdatedAt: now,
 			}
+			added++
 		}
+	}
+	om.mu.Unlock()
+
+	if om.Verbose {
+		log.Printf("orders: reconcile: exchange=%d local_open=%d (added=%d removed=%d)",
+			len(exchangeSet), localOpen, added, removed)
 	}
 
 	return nil

@@ -2,6 +2,7 @@ package btsemm
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -9,23 +10,41 @@ import (
 
 // MidPrice tracks the live mid-price for a symbol via WebSocket.
 type MidPrice struct {
-	mu      sync.RWMutex
-	mid     float64
-	bid     float64
-	ask     float64
-	symbol  string
-	ws      *WSConn
-	ready   chan struct{}
-	once    sync.Once
+	mu     sync.RWMutex
+	mid    float64
+	bid    float64
+	ask    float64
+	symbol string
+	ws     *WSConn
+	ready  chan struct{}
+	once   sync.Once
+
+	// verboseLogger, when non-nil, is called for every L1 snapshot received.
+	// Set via WithMidPriceVerboseLogger; intended for debug/firehose mode.
+	verboseLogger *log.Logger
+}
+
+// MidPriceOption configures WatchMidPrice.
+type MidPriceOption func(*MidPrice)
+
+// WithMidPriceVerboseLogger enables per-snapshot logging of every L1 update.
+// The logger is called with bid/ask/mid/spread on each snapshot. Use the
+// global log.Default() to share the standard output pipeline (timestamps,
+// log-dir routing).
+func WithMidPriceVerboseLogger(l *log.Logger) MidPriceOption {
+	return func(mp *MidPrice) { mp.verboseLogger = l }
 }
 
 // WatchMidPrice starts a background goroutine that maintains the live mid-price
 // for the given symbol. Call Price() at any time to get the current value.
 // Call Stop() when done.
-func (c *Client) WatchMidPrice(symbol string) (*MidPrice, error) {
+func (c *Client) WatchMidPrice(symbol string, opts ...MidPriceOption) (*MidPrice, error) {
 	mp := &MidPrice{
 		symbol: symbol,
 		ready:  make(chan struct{}),
+	}
+	for _, o := range opts {
+		o(mp)
 	}
 
 	ws, err := c.ConnectOrderbookWS(
@@ -53,6 +72,11 @@ func (c *Client) WatchMidPrice(symbol string) (*MidPrice, error) {
 				mp.mid = (b + a) / 2
 				mp.mu.Unlock()
 				mp.once.Do(func() { close(mp.ready) })
+
+				if mp.verboseLogger != nil {
+					mp.verboseLogger.Printf("midprice: bid=%.6f ask=%.6f mid=%.6f spread=%.6f symbol=%s",
+						b, a, (b+a)/2, a-b, symbol)
+				}
 			}
 		}),
 	)

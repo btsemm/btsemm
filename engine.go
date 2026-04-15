@@ -1,11 +1,14 @@
 package btsemm
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,6 +25,13 @@ type Strategy interface {
 
 	// OnFill is called immediately when a fill is received.
 	OnFill(fill WSFill)
+}
+
+// Dumper is optionally implemented by strategies that can emit their internal
+// state for debugging. The engine type-asserts the strategy to this interface
+// during periodic state dumps; strategies that don't implement it are skipped.
+type Dumper interface {
+	DumpState(w io.Writer)
 }
 
 // StrategyContext is passed to Strategy.Init with everything the strategy
@@ -62,7 +72,9 @@ type EngineConfig struct {
 	MinSizeIncrement  float64 // overridden by preflight if 0
 	AmendBPS          float64 // min price move in BPS of order price to trigger replace (default 1)
 	Risk              RiskConfig
-	MaxConsecErrors   int // kill after this many consecutive order errors; 0 = 10
+	MaxConsecErrors   int           // kill after this many consecutive order errors; 0 = 10
+	Verbose           bool          // enable extensive per-tick / per-message logging
+	WatchdogInterval  time.Duration // heartbeat + state dump cadence (0 = disabled)
 }
 
 // MarketInfo holds validated market parameters from the exchange.
@@ -90,14 +102,25 @@ type Engine struct {
 	consecErrors     int
 	lastRiskRejected int
 	lastPrice        float64
+
+	// Watchdog / verbose-mode bookkeeping. Read/written only on the engine
+	// main goroutine (tick + watchdog tickers) except lastFillTime, which is
+	// stored under fillsMu because it's also written from the WS goroutine.
+	tickCount      uint64
+	lastDesiredLen int
+
+	fillsMu      sync.Mutex
+	lastFillTime time.Time
 }
 
 // NewEngine creates a new engine with the given configuration and strategy.
 func NewEngine(client *Client, config EngineConfig, strategy Strategy) *Engine {
 	position := NewPositionTracker(config.Symbol)
 	orders := NewOrderManager(client, config.Symbol)
+	orders.Verbose = config.Verbose
 	risk := NewRiskManager(config.Risk, position, orders)
 	fills := NewFillHandler(config.Symbol, orders.Prefix())
+	fills.Verbose = config.Verbose
 
 	// Wire up fill processing
 	fills.OnFill(position.ProcessFill)
@@ -108,7 +131,7 @@ func NewEngine(client *Client, config EngineConfig, strategy Strategy) *Engine {
 		config.MaxConsecErrors = 10
 	}
 
-	return &Engine{
+	e := &Engine{
 		config:   config,
 		client:   client,
 		strategy: strategy,
@@ -117,6 +140,24 @@ func NewEngine(client *Client, config EngineConfig, strategy Strategy) *Engine {
 		risk:     risk,
 		fills:    fills,
 	}
+
+	// Track the time of the most recent fill so the watchdog can report it.
+	// Registered last so the position tracker and strategy callbacks already saw the fill.
+	fills.OnFill(func(WSFill) {
+		e.fillsMu.Lock()
+		e.lastFillTime = time.Now()
+		e.fillsMu.Unlock()
+	})
+
+	return e
+}
+
+// lastFill returns the time of the most recently processed fill, or the zero
+// value if no fills have been received yet.
+func (e *Engine) lastFill() time.Time {
+	e.fillsMu.Lock()
+	defer e.fillsMu.Unlock()
+	return e.lastFillTime
 }
 
 // Preflight fetches market info and validates balances before starting.
@@ -272,7 +313,13 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 
 	// Start mid-price feed
-	mp, err := e.client.WatchMidPrice(e.config.Symbol)
+	var mpOpts []MidPriceOption
+	if e.config.Verbose {
+		// Share the global logger so per-snapshot lines flow through the
+		// standard timestamp + log-dir routing pipeline.
+		mpOpts = append(mpOpts, WithMidPriceVerboseLogger(log.Default()))
+	}
+	mp, err := e.client.WatchMidPrice(e.config.Symbol, mpOpts...)
 	if err != nil {
 		return fmt.Errorf("btse: engine start midprice: %w", err)
 	}
@@ -340,6 +387,22 @@ func (e *Engine) Run(ctx context.Context) error {
 	reconcileTicker := time.NewTicker(reconcileInterval)
 	defer reconcileTicker.Stop()
 
+	// Watchdog ticker: emits a heartbeat + state dump on the engine main
+	// goroutine. Absence of heartbeats means the main loop is blocked. A
+	// non-nil channel that never fires (the zero value of <-chan time.Time)
+	// is used when the watchdog is disabled, so the select doesn't need a
+	// conditional case.
+	var watchdogCh <-chan time.Time
+	if e.config.WatchdogInterval > 0 {
+		watchdogTicker := time.NewTicker(e.config.WatchdogInterval)
+		defer watchdogTicker.Stop()
+		watchdogCh = watchdogTicker.C
+		log.Printf("engine: watchdog enabled at interval=%v", e.config.WatchdogInterval)
+		// Emit one heartbeat immediately so users see the format on startup
+		// without waiting a full interval.
+		e.watchdog()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -360,14 +423,22 @@ func (e *Engine) Run(ctx context.Context) error {
 				log.Printf("engine: periodic reconcile: %v", err)
 			}
 			e.orders.Cleanup(5 * time.Minute)
+
+		case <-watchdogCh:
+			e.watchdog()
 		}
 	}
 }
 
 func (e *Engine) tick() {
+	e.tickCount++
+
 	// Touch risk data liveness
 	mid, bid, ask, spread := e.midPrice.Snapshot()
 	if mid == 0 {
+		if e.config.Verbose {
+			log.Printf("engine: tick #%d skip: no mid price yet", e.tickCount)
+		}
 		return // no price yet
 	}
 	e.risk.TouchData()
@@ -396,8 +467,14 @@ func (e *Engine) tick() {
 		Timestamp:  time.Now(),
 	}
 
+	if e.config.Verbose {
+		log.Printf("engine: tick #%d mid=%.6f bid=%.6f ask=%.6f spread=%.6f pos=%.6f open=%d",
+			e.tickCount, mid, bid, ask, spread, state.Position.BaseQty, len(state.OpenOrders))
+	}
+
 	// Get desired orders from strategy
 	desired := e.strategy.OnTick(state)
+	e.lastDesiredLen = len(desired)
 
 	// Round prices and sizes before reconciliation
 	for i := range desired {
@@ -407,12 +484,18 @@ func (e *Engine) tick() {
 
 	// Filter out orders below min size
 	var valid []DesiredOrder
+	filtered := 0
 	for _, d := range desired {
 		if e.market.MinOrderSize > 0 && d.Size < e.market.MinOrderSize {
 			log.Printf("engine: skipping %s order: size %.8f < min %.8f", d.Side, d.Size, e.market.MinOrderSize)
+			filtered++
 			continue
 		}
 		valid = append(valid, d)
+	}
+
+	if e.config.Verbose && filtered > 0 {
+		log.Printf("engine: tick #%d filtered=%d below min size", e.tickCount, filtered)
 	}
 
 	// Reconcile desired vs actual
@@ -433,6 +516,10 @@ func (e *Engine) reconcileOrders(desired []DesiredOrder, open []*TrackedOrder, b
 	matched := make(map[string]bool) // clOrderIDs that got matched
 	hadError := false
 	riskRejected := 0
+	postOnlySkipped := 0
+	amended := 0
+	placed := 0
+	cancelled := 0
 
 	for _, d := range desired {
 		// Pre-trade risk check
@@ -460,15 +547,28 @@ func (e *Engine) reconcileOrders(desired []DesiredOrder, open []*TrackedOrder, b
 					log.Printf("engine: amend failed: %v", err)
 					hadError = true
 				}
+				amended++
 			}
 			// Otherwise, order is close enough — no API call needed
 		} else {
-			// Skip post-only orders that would cross the spread (only for new placements)
+			// Skip post-only orders that would cross the spread (only for new placements).
+			// This path was previously SILENT — it's the most plausible cause of the 77/80
+			// incident (a SELL replacement gets dropped without any log line).
 			if d.PostOnly && bid > 0 && ask > 0 {
 				if d.Side == SideBuy && d.Price >= ask {
+					postOnlySkipped++
+					if e.config.Verbose {
+						log.Printf("engine: post-only skip BUY @ %.6f (would cross: ask=%.6f bid=%.6f)",
+							d.Price, ask, bid)
+					}
 					continue
 				}
 				if d.Side == SideSell && d.Price <= bid {
+					postOnlySkipped++
+					if e.config.Verbose {
+						log.Printf("engine: post-only skip SELL @ %.6f (would cross: bid=%.6f ask=%.6f)",
+							d.Price, bid, ask)
+					}
 					continue
 				}
 			}
@@ -482,6 +582,8 @@ func (e *Engine) reconcileOrders(desired []DesiredOrder, open []*TrackedOrder, b
 					log.Printf("engine: place failed: %v", err)
 					hadError = true
 				}
+			} else {
+				placed++
 			}
 		}
 	}
@@ -493,6 +595,7 @@ func (e *Engine) reconcileOrders(desired []DesiredOrder, open []*TrackedOrder, b
 			if err := e.orders.Cancel(o.ClOrderID); err != nil {
 				log.Printf("engine: cancel failed: %v", err)
 			}
+			cancelled++
 		}
 	}
 
@@ -500,6 +603,11 @@ func (e *Engine) reconcileOrders(desired []DesiredOrder, open []*TrackedOrder, b
 		log.Printf("engine: risk rejected %d orders (position limit)", riskRejected)
 	}
 	e.lastRiskRejected = riskRejected
+
+	if e.config.Verbose && (placed+cancelled+amended+postOnlySkipped+riskRejected) > 0 {
+		log.Printf("engine: reconcile: matched=%d placed=%d amended=%d cancelled=%d postOnlySkip=%d riskRejected=%d",
+			len(matched), placed, amended, cancelled, postOnlySkipped, riskRejected)
+	}
 
 	// Track consecutive errors
 	if hadError {
@@ -581,4 +689,84 @@ func (e *Engine) Orders() *OrderManager {
 // Risk returns the risk manager.
 func (e *Engine) Risk() *RiskManager {
 	return e.risk
+}
+
+// watchdog emits a single-line heartbeat covering the most important runtime
+// signals, then a full state dump. Runs on the engine main goroutine; absence
+// of heartbeats is the diagnostic signal that the main loop is stuck.
+func (e *Engine) watchdog() {
+	mid, bid, ask, spread := e.midPrice.Snapshot()
+	pos := e.position.Snapshot()
+	buys, sells, total := e.orders.OrderCounts()
+
+	lastFillStr := "never"
+	if t := e.lastFill(); !t.IsZero() {
+		lastFillStr = time.Since(t).Truncate(time.Second).String()
+	}
+	lastPlaceStr := "never"
+	if t := e.orders.LastPlaceTime(); !t.IsZero() {
+		lastPlaceStr = time.Since(t).Truncate(time.Second).String()
+	}
+
+	riskStr := "ok"
+	if e.risk.IsKilled() {
+		riskStr = "KILLED:" + e.risk.KillReason()
+	}
+
+	log.Printf("engine: HEARTBEAT tick=%d mid=%.6f bid=%.6f ask=%.6f spread=%.6f pos=%.6f open=%d/%d buys=%d sells=%d lastFill=%s lastPlace=%s risk=%s consecErr=%d",
+		e.tickCount, mid, bid, ask, spread, pos.BaseQty,
+		total, e.lastDesiredLen, buys, sells,
+		lastFillStr, lastPlaceStr, riskStr, e.consecErrors)
+
+	e.dumpState()
+}
+
+// dumpState emits a multi-line snapshot of position, risk, all open orders,
+// and (if the strategy implements Dumper) the strategy's internal state.
+// Each line is fed through the global logger so the categoryWriter in main.go
+// can route them to the per-category file in -log-dir mode.
+func (e *Engine) dumpState() {
+	log.Printf("engine: === STATE DUMP ===")
+
+	pos := e.position.Snapshot()
+	log.Printf("engine: position: base=%.8f quoteSpent=%.4f avgCost=%.6f fills=%d fees=%.6f",
+		pos.BaseQty, pos.QuoteSpent, pos.AvgCost, pos.FillCount, pos.TotalFees)
+
+	rc := e.risk.Config()
+	log.Printf("engine: risk: maxPos=%.6f maxLoss=%.2f maxOrders=%d killed=%v",
+		rc.MaxPositionSize, rc.MaxLossUSDT, rc.MaxOpenOrders, e.risk.IsKilled())
+
+	buys, sells, total := e.orders.OrderCounts()
+	log.Printf("engine: orders: %d open (%d BUY, %d SELL)", total, buys, sells)
+	e.orders.DumpOrders(&logLineWriter{prefix: "engine:"})
+
+	if d, ok := e.strategy.(Dumper); ok {
+		d.DumpState(&logLineWriter{})
+	}
+
+	log.Printf("engine: === END STATE DUMP ===")
+}
+
+// logLineWriter adapts an io.Writer to the global log package: each newline-
+// terminated line in the input is emitted as a separate log.Print call so it
+// receives a timestamp and (in -log-dir mode) gets routed to the right
+// per-category file. The optional prefix is currently unused by callers but
+// reserved for future per-call categorisation.
+type logLineWriter struct {
+	prefix string
+	buf    []byte
+}
+
+func (w *logLineWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	for {
+		i := bytes.IndexByte(w.buf, '\n')
+		if i < 0 {
+			break
+		}
+		line := string(w.buf[:i])
+		w.buf = w.buf[i+1:]
+		log.Print(line)
+	}
+	return len(p), nil
 }

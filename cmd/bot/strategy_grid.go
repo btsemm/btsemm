@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"strings"
@@ -43,6 +44,7 @@ type gridStrategy struct {
 	ratio       float64
 	sizePerGrid float64 // USDT per grid
 	makerFeePct float64 // actual maker fee from exchange
+	lastMid     float64 // last mid observed by OnTick; used by DumpState
 }
 
 func newGrid() btsemm.Strategy {
@@ -217,6 +219,7 @@ func (s *gridStrategy) OnTick(state btsemm.MarketState) []btsemm.DesiredOrder {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.lastMid = state.Mid
 
 	var orders []btsemm.DesiredOrder
 
@@ -241,6 +244,47 @@ func (s *gridStrategy) OnTick(state btsemm.MarketState) []btsemm.DesiredOrder {
 	}
 
 	return orders
+}
+
+// DumpState implements the btsemm.Dumper interface. It prints every grid level
+// with its current side (gridBuy/gridSell), the price range it covers, and a
+// marker on the gap that brackets the most recently observed mid price.
+//
+// The mid is taken from the strategy's own observation, since the dumper has
+// no access to the live MidPrice. Callers that have a current mid can pass it
+// via DumpStateAt; DumpState falls back to the last value seen by OnTick.
+func (s *gridStrategy) DumpState(w io.Writer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	buyCount, sellCount := 0, 0
+	fmt.Fprintf(w, "grid: === GRID STATE (%d grids, ratio=%.6f, sizePerGrid=%.4f) ===\n",
+		s.grids, s.ratio, s.sizePerGrid)
+	for i := 0; i < s.grids; i++ {
+		state := "BUY "
+		if s.state[i] == gridSell {
+			state = "SELL"
+			sellCount++
+		} else {
+			buyCount++
+		}
+		marker := ""
+		if s.lastMid > 0 && s.levels[i] <= s.lastMid && s.levels[i+1] > s.lastMid {
+			marker = fmt.Sprintf("  ◄ contains mid %.6f", s.lastMid)
+		}
+		size := s.sizePerGrid / s.levels[i]
+		fmt.Fprintf(w, "grid:   [%2d] %s  %10.6f → %10.6f  size=%.6f  state=%s%s\n",
+			i, state, s.levels[i], s.levels[i+1], size, stateName(s.state[i]), marker)
+	}
+	fmt.Fprintf(w, "grid: summary: %d gridBuy, %d gridSell\n", buyCount, sellCount)
+	fmt.Fprintf(w, "grid: === END GRID STATE ===\n")
+}
+
+func stateName(s gridState) string {
+	if s == gridBuy {
+		return "gridBuy"
+	}
+	return "gridSell"
 }
 
 func (s *gridStrategy) OnFill(fill btsemm.WSFill) {

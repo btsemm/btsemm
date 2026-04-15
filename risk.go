@@ -154,6 +154,14 @@ func (rm *RiskManager) SetMaxPosition(size float64) {
 	rm.mu.Unlock()
 }
 
+// Config returns a copy of the current risk configuration. Used by the
+// watchdog/state dump to surface the active limits.
+func (rm *RiskManager) Config() RiskConfig {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.config
+}
+
 // Reset clears the kill switch, allowing the bot to resume.
 func (rm *RiskManager) Reset() {
 	rm.mu.Lock()

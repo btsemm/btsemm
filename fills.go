@@ -57,6 +57,10 @@ type FillHandler struct {
 	orderPrefix           string
 	fillCallbacks         []func(WSFill)
 	notificationCallbacks []func(WSOrderNotification)
+
+	// Verbose enables per-notification debug logging in Handle. Set by the
+	// engine from EngineConfig.Verbose.
+	Verbose bool
 }
 
 // NewFillHandler creates a new FillHandler that only processes events
@@ -100,6 +104,12 @@ func (fh *FillHandler) Handle(msg WSMessage) {
 		return
 	}
 
+	if fh.Verbose {
+		log.Printf("fills: notif side=%s status=%d size=%.6f fillSize=%.6f remaining=%.6f price=%.6f avgFillPrice=%.6f clOID=%s",
+			notif.Side, notif.Status, notif.Size, notif.FillSize, notif.RemainingSize,
+			notif.Price, notif.AvgFillPrice, notif.ClOrderID)
+	}
+
 	// Fire notification callbacks
 	for _, cb := range fh.notificationCallbacks {
 		cb(*notif)
@@ -118,6 +128,10 @@ func (fh *FillHandler) Handle(msg WSMessage) {
 		}
 		if fill.Price == 0 {
 			fill.Price = notif.Price
+		}
+		if fh.Verbose {
+			log.Printf("fills: dispatching fill %s %.6f @ %.6f to %d callbacks",
+				fill.Side, fill.Size, fill.Price, len(fh.fillCallbacks))
 		}
 		for _, cb := range fh.fillCallbacks {
 			cb(fill)

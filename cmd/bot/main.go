@@ -71,6 +71,11 @@ var (
 	flagVersion     = flag.Bool("version", false, "print short version and exit")
 	flagFullVersion = flag.Bool("fullversion", false, "print full version and exit")
 
+	// Logging
+	flagVerbose  = flag.Bool("verbose", false, "enable extensive per-tick / per-message logging (incl. per-WS-message firehose)")
+	flagWatchdog = flag.Duration("watchdog", 30*time.Second, "watchdog heartbeat + state dump interval (0=off)")
+	flagLogDir   = flag.String("log-dir", "", "if set, additionally write per-category log files into this directory")
+
 	// Risk
 	flagMaxPos  = flag.Float64("risk.max-pos", 100, "max position in USDT")
 	flagMaxLoss = flag.Float64("risk.max-loss", 10, "max loss in USDT before kill")
@@ -111,8 +116,31 @@ func main() {
 		log.Fatalf("open log file: %v", err)
 	}
 	defer logFile.Close()
-	log.SetOutput(io.MultiWriter(os.Stdout, logFile))
+
+	// Build the log writer chain. The combined log file + stdout always get
+	// every line; -log-dir adds an additional categoryWriter that fans
+	// individual lines out to per-category files based on prefix.
+	writers := []io.Writer{os.Stdout, logFile}
+	if *flagLogDir != "" {
+		cw, closeCW, err := newCategoryWriter(*flagLogDir)
+		if err != nil {
+			log.Fatalf("setup -log-dir: %v", err)
+		}
+		defer closeCW()
+		writers = append(writers, cw)
+	}
+	log.SetOutput(io.MultiWriter(writers...))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+
+	// Tee fd 2 (real stderr) to the log file too, so panic traces and
+	// SIGQUIT goroutine dumps — which the Go runtime writes directly to
+	// fd 2, bypassing the log package — also land in the log we'll be
+	// reading post-mortem.
+	if closeStderrTee, err := teeStderr(logFile); err != nil {
+		log.Printf("WARNING: stderr tee failed (panic/SIGQUIT traces will only appear on terminal): %v", err)
+	} else {
+		defer closeStderrTee()
+	}
 
 	log.Printf("=== bot %s ===", Commit)
 	log.Printf("=== cmd: %s ===", strings.Join(os.Args, " "))
@@ -148,6 +176,8 @@ func main() {
 		DeadManTimeout:    *flagDeadMan,
 		MaxConsecErrors:   *flagMaxErrors,
 		AmendBPS:          *flagAmendBPS,
+		Verbose:           *flagVerbose,
+		WatchdogInterval:  *flagWatchdog,
 		Risk: btsemm.RiskConfig{
 			MaxPositionUSDT:  *flagMaxPos,
 			MaxLossUSDT:      *flagMaxLoss,
