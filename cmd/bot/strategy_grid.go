@@ -280,6 +280,62 @@ func (s *gridStrategy) DumpState(w io.Writer) {
 	fmt.Fprintf(w, "grid: === END GRID STATE ===\n")
 }
 
+// GridLevelStatus is the JSON representation of a single grid level.
+type GridLevelStatus struct {
+	Index int     `json:"index"`
+	Lower float64 `json:"lower"`
+	Upper float64 `json:"upper"`
+	Side  string  `json:"side"`
+	Size  float64 `json:"size"`
+}
+
+// GridStatus is the JSON representation of the full grid strategy state.
+type GridStatus struct {
+	Grids       int               `json:"grids"`
+	Low         float64           `json:"low"`
+	High        float64           `json:"high"`
+	Ratio       float64           `json:"ratio"`
+	SizePerGrid float64           `json:"sizePerGrid"`
+	MakerFeePct float64           `json:"makerFeePct"`
+	LastMid     float64           `json:"lastMid"`
+	BuyCount    int               `json:"buyCount"`
+	SellCount   int               `json:"sellCount"`
+	Levels      []GridLevelStatus `json:"levels"`
+}
+
+// Status implements btsemm.StatusProvider. Returns a GridStatus struct.
+func (s *gridStrategy) Status() interface{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	gs := GridStatus{
+		Grids:       s.grids,
+		Low:         s.low,
+		High:        s.high,
+		Ratio:       s.ratio,
+		SizePerGrid: s.sizePerGrid,
+		MakerFeePct: s.makerFeePct,
+		LastMid:     s.lastMid,
+		Levels:      make([]GridLevelStatus, s.grids),
+	}
+	for i := 0; i < s.grids; i++ {
+		side := "BUY"
+		if s.state[i] == gridSell {
+			side = "SELL"
+			gs.SellCount++
+		} else {
+			gs.BuyCount++
+		}
+		gs.Levels[i] = GridLevelStatus{
+			Index: i,
+			Lower: s.levels[i],
+			Upper: s.levels[i+1],
+			Side:  side,
+			Size:  s.sizePerGrid / s.levels[i],
+		}
+	}
+	return gs
+}
+
 func stateName(s gridState) string {
 	if s == gridBuy {
 		return "gridBuy"

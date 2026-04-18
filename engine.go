@@ -34,6 +34,12 @@ type Dumper interface {
 	DumpState(w io.Writer)
 }
 
+// StatusProvider is optionally implemented by strategies that can export their
+// state as a JSON-serializable value for the web dashboard.
+type StatusProvider interface {
+	Status() interface{}
+}
+
 // StrategyContext is passed to Strategy.Init with everything the strategy
 // needs to validate its requirements.
 type StrategyContext struct {
@@ -108,6 +114,7 @@ type Engine struct {
 	// stored under fillsMu because it's also written from the WS goroutine.
 	tickCount      uint64
 	lastDesiredLen int
+	startedAt      time.Time
 
 	fillsMu      sync.Mutex
 	lastFillTime time.Time
@@ -297,6 +304,8 @@ func (e *Engine) RoundSize(size float64) float64 {
 
 // Run starts the engine and blocks until the context is cancelled.
 func (e *Engine) Run(ctx context.Context) error {
+	e.startedAt = time.Now()
+
 	// Preflight checks
 	if err := e.Preflight(); err != nil {
 		return err
@@ -690,6 +699,41 @@ func (e *Engine) Orders() *OrderManager {
 func (e *Engine) Risk() *RiskManager {
 	return e.risk
 }
+
+// MidPriceSnapshot returns the current mid, bid, ask, and spread.
+func (e *Engine) MidPriceSnapshot() (mid, bid, ask, spread float64) {
+	if e.midPrice == nil {
+		return 0, 0, 0, 0
+	}
+	return e.midPrice.Snapshot()
+}
+
+// Config returns a copy of the engine configuration.
+func (e *Engine) EngineConfig() EngineConfig {
+	return e.config
+}
+
+// TickCount returns the number of ticks executed so far.
+func (e *Engine) TickCount() uint64 { return e.tickCount }
+
+// ConsecErrors returns the current consecutive-error count.
+func (e *Engine) ConsecErrors() int { return e.consecErrors }
+
+// LastDesiredLen returns the number of desired orders from the most recent tick.
+func (e *Engine) LastDesiredLen() int { return e.lastDesiredLen }
+
+// LastFillTime returns the time of the most recently processed fill.
+func (e *Engine) LastFillTime() time.Time { return e.lastFill() }
+
+// StrategyRaw returns the underlying Strategy value, allowing callers to
+// type-assert to optional interfaces like StatusProvider.
+func (e *Engine) StrategyRaw() Strategy { return e.strategy }
+
+// Market returns the validated market parameters from preflight.
+func (e *Engine) Market() MarketInfo { return e.market }
+
+// StartedAt is set when Run begins. Zero value means not started yet.
+func (e *Engine) StartedAt() time.Time { return e.startedAt }
 
 // watchdog emits a single-line heartbeat covering the most important runtime
 // signals, then a full state dump. Runs on the engine main goroutine; absence

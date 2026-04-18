@@ -76,6 +76,9 @@ var (
 	flagWatchdog = flag.Duration("watchdog", 30*time.Second, "watchdog heartbeat + state dump interval (0=off)")
 	flagLogDir   = flag.String("log-dir", "", "if set, additionally write per-category log files into this directory")
 
+	// Web dashboard
+	flagHTTP = flag.String("http", "127.0.0.1:8082", "web dashboard listen address (empty string to disable)")
+
 	// Risk
 	flagMaxPos  = flag.Float64("risk.max-pos", 100, "max position in USDT")
 	flagMaxLoss = flag.Float64("risk.max-loss", 10, "max loss in USDT before kill")
@@ -187,6 +190,11 @@ func main() {
 	}
 
 	engine := btsemm.NewEngine(client, config, strategy)
+
+	// Start web dashboard (non-blocking)
+	if *flagHTTP != "" {
+		startWebServer(*flagHTTP, engine, *flagStrategy, Commit)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
