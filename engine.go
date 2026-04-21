@@ -81,6 +81,7 @@ type EngineConfig struct {
 	MaxConsecErrors   int           // kill after this many consecutive order errors; 0 = 10
 	Verbose           bool          // enable extensive per-tick / per-message logging
 	WatchdogInterval  time.Duration // heartbeat + state dump cadence (0 = disabled)
+	DefaultFeeRate    float64       // fallback fee rate as fraction (e.g. 0.002 for 0.2%); used when exchange doesn't report fees
 }
 
 // MarketInfo holds validated market parameters from the exchange.
@@ -128,6 +129,7 @@ func NewEngine(client *Client, config EngineConfig, strategy Strategy) *Engine {
 	risk := NewRiskManager(config.Risk, position, orders)
 	fills := NewFillHandler(config.Symbol, orders.Prefix())
 	fills.Verbose = config.Verbose
+	fills.DefaultFeeRate = config.DefaultFeeRate
 
 	// Wire up fill processing
 	fills.OnFill(position.ProcessFill)
@@ -269,6 +271,19 @@ func (e *Engine) Preflight() error {
 	}
 
 	e.lastPrice = lastPrice
+
+	// If no explicit fee rate was configured, try to fetch it from the exchange.
+	if e.config.DefaultFeeRate == 0 {
+		fees, err := e.client.GetFees(symbol)
+		if err != nil {
+			log.Printf("preflight: WARNING: could not fetch fees for fee estimation: %v", err)
+		} else if len(fees) > 0 {
+			e.config.DefaultFeeRate = fees[0].MakerFee // API returns fraction (e.g. 0.002)
+			e.fills.DefaultFeeRate = e.config.DefaultFeeRate
+			log.Printf("preflight: default_fee_rate=%.6f (%.4f%%)", e.config.DefaultFeeRate, e.config.DefaultFeeRate*100)
+		}
+	}
+
 	return nil
 }
 
@@ -525,7 +540,7 @@ func (e *Engine) reconcileOrders(desired []DesiredOrder, open []*TrackedOrder, b
 	matched := make(map[string]bool) // clOrderIDs that got matched
 	hadError := false
 	riskRejected := 0
-	postOnlySkipped := 0
+	crossedToLimit := 0
 	amended := 0
 	placed := 0
 	cancelled := 0
@@ -560,30 +575,30 @@ func (e *Engine) reconcileOrders(desired []DesiredOrder, open []*TrackedOrder, b
 			}
 			// Otherwise, order is close enough — no API call needed
 		} else {
-			// Skip post-only orders that would cross the spread (only for new placements).
-			// This path was previously SILENT — it's the most plausible cause of the 77/80
-			// incident (a SELL replacement gets dropped without any log line).
-			if d.PostOnly && bid > 0 && ask > 0 {
+			// Handle post-only orders that would cross the spread. Instead of
+			// skipping (which permanently loses a grid level), place as a
+			// regular limit order. It fills immediately as a taker — which is
+			// actually at a BETTER price than the intended grid level (e.g. a
+			// SELL at 0.2547 fills at bid 0.2569). The grid cycle completes
+			// and the strategy can flip back.
+			postOnly := d.PostOnly
+			if postOnly && bid > 0 && ask > 0 {
 				if d.Side == SideBuy && d.Price >= ask {
-					postOnlySkipped++
-					if e.config.Verbose {
-						log.Printf("engine: post-only skip BUY @ %.6f (would cross: ask=%.6f bid=%.6f)",
-							d.Price, ask, bid)
-					}
-					continue
+					postOnly = false
+					crossedToLimit++
+					log.Printf("engine: post-only would cross, placing as limit: BUY @ %.6f (ask=%.6f bid=%.6f)",
+						d.Price, ask, bid)
 				}
 				if d.Side == SideSell && d.Price <= bid {
-					postOnlySkipped++
-					if e.config.Verbose {
-						log.Printf("engine: post-only skip SELL @ %.6f (would cross: bid=%.6f ask=%.6f)",
-							d.Price, bid, ask)
-					}
-					continue
+					postOnly = false
+					crossedToLimit++
+					log.Printf("engine: post-only would cross, placing as limit: SELL @ %.6f (bid=%.6f ask=%.6f)",
+						d.Price, bid, ask)
 				}
 			}
 			// Place new order
 			log.Printf("engine: placing %s %.6f @ %.6f", d.Side, d.Size, d.Price)
-			if _, err := e.orders.Place(d.Side, d.Price, d.Size, d.PostOnly); err != nil {
+			if _, err := e.orders.Place(d.Side, d.Price, d.Size, postOnly); err != nil {
 				// Post-only rejections are expected near the spread — don't count as errors
 				if strings.Contains(err.Error(), "post_rejected") {
 					log.Printf("engine: post-only rejected %s @ %.6f (near spread, skipping)", d.Side, d.Price)
@@ -613,9 +628,9 @@ func (e *Engine) reconcileOrders(desired []DesiredOrder, open []*TrackedOrder, b
 	}
 	e.lastRiskRejected = riskRejected
 
-	if e.config.Verbose && (placed+cancelled+amended+postOnlySkipped+riskRejected) > 0 {
-		log.Printf("engine: reconcile: matched=%d placed=%d amended=%d cancelled=%d postOnlySkip=%d riskRejected=%d",
-			len(matched), placed, amended, cancelled, postOnlySkipped, riskRejected)
+	if e.config.Verbose && (placed+cancelled+amended+crossedToLimit+riskRejected) > 0 {
+		log.Printf("engine: reconcile: matched=%d placed=%d amended=%d cancelled=%d crossedToLimit=%d riskRejected=%d",
+			len(matched), placed, amended, cancelled, crossedToLimit, riskRejected)
 	}
 
 	// Track consecutive errors
