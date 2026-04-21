@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"codeberg.org/btsemm/btsemm"
@@ -27,17 +28,19 @@ type webServer struct {
 
 // statusResponse is the JSON payload returned by GET /api/status.
 type statusResponse struct {
-	Symbol   string        `json:"symbol"`
-	Strategy string        `json:"strategy"`
-	Version  string        `json:"version"`
-	Uptime   string        `json:"uptime"`
-	Config   configStatus  `json:"config"`
-	Market   marketStatus  `json:"market"`
-	Position posStatus     `json:"position"`
-	Risk     riskStatus    `json:"risk"`
-	Engine   engineStatus  `json:"engine"`
-	Orders   ordersStatus  `json:"orders"`
-	Grid     interface{}   `json:"grid,omitempty"`
+	Symbol        string        `json:"symbol"`
+	BaseCurrency  string        `json:"baseCurrency"`
+	QuoteCurrency string        `json:"quoteCurrency"`
+	Strategy      string        `json:"strategy"`
+	Version       string        `json:"version"`
+	Uptime        string        `json:"uptime"`
+	Config        configStatus  `json:"config"`
+	Market        marketStatus  `json:"market"`
+	Position      posStatus     `json:"position"`
+	Risk          riskStatus    `json:"risk"`
+	Engine        engineStatus  `json:"engine"`
+	Orders        ordersStatus  `json:"orders"`
+	Grid          interface{}   `json:"grid,omitempty"`
 }
 
 type configStatus struct {
@@ -59,12 +62,14 @@ type marketStatus struct {
 }
 
 type posStatus struct {
-	BaseQty    float64 `json:"baseQty"`
-	QuoteSpent float64 `json:"quoteSpent"`
-	AvgCost    float64 `json:"avgCost"`
-	TotalFees  float64 `json:"totalFees"`
-	FillCount  int     `json:"fillCount"`
-	UpdatedAt  string  `json:"updatedAt"`
+	BaseQty        float64 `json:"baseQty"`
+	QuoteSpent     float64 `json:"quoteSpent"`
+	AvgCost        float64 `json:"avgCost"`
+	TotalFees      float64 `json:"totalFees"`
+	FillCount      int     `json:"fillCount"`
+	UpdatedAt      string  `json:"updatedAt"`
+	InventoryValue float64 `json:"inventoryValue"` // baseQty * mid
+	TotalPnL       float64 `json:"totalPnL"`       // baseQty * mid - quoteSpent - totalFees
 }
 
 type riskStatus struct {
@@ -103,6 +108,13 @@ type orderEntry struct {
 
 func (ws *webServer) buildStatus() statusResponse {
 	cfg := ws.engine.EngineConfig()
+
+	// Parse base/quote from symbol (e.g. "JUNO-USDT" → "JUNO", "USDT")
+	base, quote := cfg.Symbol, ""
+	if parts := strings.SplitN(cfg.Symbol, "-", 2); len(parts) == 2 {
+		base, quote = parts[0], parts[1]
+	}
+
 	mid, bid, ask, spread := ws.engine.MidPriceSnapshot()
 	pos := ws.engine.Position().Snapshot()
 	rc := ws.engine.Risk().Config()
@@ -150,10 +162,12 @@ func (ws *webServer) buildStatus() statusResponse {
 	}
 
 	resp := statusResponse{
-		Symbol:   cfg.Symbol,
-		Strategy: ws.strategyName,
-		Version:  ws.version,
-		Uptime:   uptime,
+		Symbol:        cfg.Symbol,
+		BaseCurrency:  base,
+		QuoteCurrency: quote,
+		Strategy:      ws.strategyName,
+		Version:       ws.version,
+		Uptime:        uptime,
 		Config: configStatus{
 			Symbol:            cfg.Symbol,
 			TickInterval:      cfg.TickInterval.String(),
@@ -166,12 +180,14 @@ func (ws *webServer) buildStatus() statusResponse {
 		},
 		Market: marketStatus{Mid: mid, Bid: bid, Ask: ask, Spread: spread},
 		Position: posStatus{
-			BaseQty:    pos.BaseQty,
-			QuoteSpent: pos.QuoteSpent,
-			AvgCost:    pos.AvgCost,
-			TotalFees:  pos.TotalFees,
-			FillCount:  pos.FillCount,
-			UpdatedAt:  fmtTime(pos.UpdatedAt),
+			BaseQty:        pos.BaseQty,
+			QuoteSpent:     pos.QuoteSpent,
+			AvgCost:        pos.AvgCost,
+			TotalFees:      pos.TotalFees,
+			FillCount:      pos.FillCount,
+			UpdatedAt:      fmtTime(pos.UpdatedAt),
+			InventoryValue: pos.BaseQty * mid,
+			TotalPnL:       pos.BaseQty*mid - pos.QuoteSpent - pos.TotalFees,
 		},
 		Risk: riskStatus{
 			MaxPositionSize: rc.MaxPositionSize,
@@ -297,6 +313,42 @@ const dashboardHTML = `<!DOCTYPE html>
 
 <div class="container-fluid">
 
+<!-- Row 0: Profit banner -->
+<div class="row g-2 mb-2">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-body py-2">
+        <div class="row align-items-center">
+          <div class="col-auto">
+            <h6>Total PnL</h6>
+            <div class="big-val" id="totalPnL" style="font-size:1.5rem">---</div>
+          </div>
+          <div class="col-auto">
+            <h6>Grid Profit (realized)</h6>
+            <div class="big-val val-ok" id="gridProfit" style="font-size:1.5rem">---</div>
+          </div>
+          <div class="col-auto">
+            <h6>Completed Cycles</h6>
+            <div class="big-val val" id="completedCycles">---</div>
+          </div>
+          <div class="col-auto">
+            <h6>Avg / Cycle</h6>
+            <div class="big-val val" id="profitPerCycle">---</div>
+          </div>
+          <div class="col-auto">
+            <h6>Inventory Value</h6>
+            <div class="big-val val" id="inventoryValue">---</div>
+          </div>
+          <div class="col-auto">
+            <h6>Fees Paid</h6>
+            <div class="big-val val" id="totalFees">---</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Row 1: Market + Position + Risk + Engine -->
 <div class="row g-2 mb-2">
 
@@ -318,15 +370,15 @@ const dashboardHTML = `<!DOCTYPE html>
     <div class="card h-100">
       <div class="card-header py-1">Position</div>
       <div class="card-body py-2">
-        <h6>Base Qty</h6><div class="big-val val" id="baseQty">---</div>
+        <h6 id="baseLabel">Base</h6>
+        <div class="big-val val" id="baseQty">---</div>
+        <h6 class="mt-1" id="baseValueLabel">Value</h6>
+        <span class="val" id="baseValue">---</span>
         <div class="row mt-1">
           <div class="col-6"><h6>Avg Cost</h6><span class="val" id="avgCost">---</span></div>
           <div class="col-6"><h6>Fills</h6><span class="val" id="fillCount">---</span></div>
         </div>
-        <div class="row mt-1">
-          <div class="col-6"><h6>Quote Spent</h6><span class="val" id="quoteSpent">---</span></div>
-          <div class="col-6"><h6>Fees</h6><span class="val" id="totalFees">---</span></div>
-        </div>
+        <h6 class="mt-1">Net Quote Flow</h6><span class="val" id="quoteSpent">---</span>
       </div>
     </div>
   </div>
@@ -430,12 +482,32 @@ function update(d) {
   $('ask').textContent = fmt(d.market.ask);
   $('spread').textContent = fmt(d.market.spread);
 
-  // Position
-  $('baseQty').textContent = fmt(d.position.baseQty, 4);
+  // Profit banner
+  const pnl = d.position.totalPnL;
+  const pnlEl = $('totalPnL');
+  pnlEl.textContent = (pnl >= 0 ? '+' : '') + fmt(pnl, 4) + ' USDT';
+  pnlEl.className = 'big-val ' + (pnl >= 0 ? 'val-ok' : 'val-warn');
+  $('inventoryValue').textContent = fmt(d.position.inventoryValue, 4) + ' USDT';
+  $('totalFees').textContent = fmt(d.position.totalFees, 4) + ' USDT';
+
+  if (d.grid) {
+    const gp = $('gridProfit');
+    gp.textContent = (d.grid.totalProfitUSDT >= 0 ? '+' : '') + fmt(d.grid.totalProfitUSDT, 4) + ' USDT';
+    gp.className = 'big-val ' + (d.grid.totalProfitUSDT >= 0 ? 'val-ok' : 'val-warn');
+    $('completedCycles').textContent = d.grid.completedCycles;
+    $('profitPerCycle').textContent = fmt(d.grid.profitPerCycle, 4) + ' USDT';
+  }
+
+  // Position — with currency labels
+  const base = d.baseCurrency || 'BASE';
+  const quote = d.quoteCurrency || 'USDT';
+  $('baseLabel').textContent = base;
+  $('baseQty').textContent = fmt(d.position.baseQty, 4) + ' ' + base;
+  $('baseValueLabel').textContent = 'Value in ' + quote;
+  $('baseValue').textContent = fmt(d.position.inventoryValue, 4) + ' ' + quote;
   $('avgCost').textContent = fmt(d.position.avgCost);
   $('fillCount').textContent = d.position.fillCount;
-  $('quoteSpent').textContent = fmt(d.position.quoteSpent, 4);
-  $('totalFees').textContent = fmt(d.position.totalFees, 4);
+  $('quoteSpent').textContent = fmt(d.position.quoteSpent, 4) + ' ' + quote;
 
   // Risk
   const killed = d.risk.killed;

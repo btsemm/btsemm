@@ -23,6 +23,8 @@ type WSOrderNotification struct {
 	TimeInForce   string      `json:"time_in_force"`
 	Maker         bool        `json:"maker"`
 	PostOnly      bool        `json:"postOnly"`
+	FeeAmount     float64     `json:"feeAmount"`
+	FeeCurrency   string      `json:"feeCurrency"`
 }
 
 // NormalizedSide returns "BUY" or "SELL" from BTSE's "MODE_BUY"/"MODE_SELL" format.
@@ -61,6 +63,11 @@ type FillHandler struct {
 	// Verbose enables per-notification debug logging in Handle. Set by the
 	// engine from EngineConfig.Verbose.
 	Verbose bool
+
+	// DefaultFeeRate is the fallback fee rate (as a fraction, e.g. 0.002 for
+	// 0.2%) used to estimate fees when the exchange notification doesn't
+	// include them. Set to 0 to disable estimation.
+	DefaultFeeRate float64
 }
 
 // NewFillHandler creates a new FillHandler that only processes events
@@ -85,6 +92,10 @@ func (fh *FillHandler) Handle(msg WSMessage) {
 		return
 	}
 
+	if fh.Verbose {
+		log.Printf("fills: raw notif JSON: %s", string(msg.Data))
+	}
+
 	notif, err := msg.ParseOrderNotification()
 	if err != nil {
 		log.Printf("fills: parse error: %v", err)
@@ -105,9 +116,9 @@ func (fh *FillHandler) Handle(msg WSMessage) {
 	}
 
 	if fh.Verbose {
-		log.Printf("fills: notif side=%s status=%d size=%.6f fillSize=%.6f remaining=%.6f price=%.6f avgFillPrice=%.6f clOID=%s",
+		log.Printf("fills: notif side=%s status=%d size=%.6f fillSize=%.6f remaining=%.6f price=%.6f avgFillPrice=%.6f fee=%.8f feeCcy=%s maker=%v clOID=%s",
 			notif.Side, notif.Status, notif.Size, notif.FillSize, notif.RemainingSize,
-			notif.Price, notif.AvgFillPrice, notif.ClOrderID)
+			notif.Price, notif.AvgFillPrice, notif.FeeAmount, notif.FeeCurrency, notif.Maker, notif.ClOrderID)
 	}
 
 	// Fire notification callbacks
@@ -118,16 +129,22 @@ func (fh *FillHandler) Handle(msg WSMessage) {
 	// If there was a fill, synthesize a WSFill and fire fill callbacks
 	if notif.FillSize > 0 {
 		fill := WSFill{
-			OrderID:   notif.OrderID,
-			ClOrderID: notif.ClOrderID,
-			Symbol:    notif.Symbol,
-			Side:      notif.Side,
-			Price:     notif.AvgFillPrice,
-			Size:      notif.FillSize,
-			Timestamp: notif.Timestamp,
+			OrderID:     notif.OrderID,
+			ClOrderID:   notif.ClOrderID,
+			Symbol:      notif.Symbol,
+			Side:        notif.Side,
+			Price:       notif.AvgFillPrice,
+			Size:        notif.FillSize,
+			Fee:         notif.FeeAmount,
+			FeeCurrency: notif.FeeCurrency,
+			Timestamp:   notif.Timestamp,
 		}
 		if fill.Price == 0 {
 			fill.Price = notif.Price
+		}
+		// If the exchange didn't report a fee, estimate it from the default rate.
+		if fill.Fee == 0 && fh.DefaultFeeRate > 0 {
+			fill.Fee = fill.Size * fill.Price * fh.DefaultFeeRate
 		}
 		if fh.Verbose {
 			log.Printf("fills: dispatching fill %s %.6f @ %.6f to %d callbacks",

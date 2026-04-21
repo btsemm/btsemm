@@ -45,6 +45,10 @@ type gridStrategy struct {
 	sizePerGrid float64 // USDT per grid
 	makerFeePct float64 // actual maker fee from exchange
 	lastMid     float64 // last mid observed by OnTick; used by DumpState
+
+	// Profit tracking
+	totalProfitUSDT float64 // accumulated net profit from completed grid cycles
+	completedCycles int     // number of completed buy→sell round trips
 }
 
 func newGrid() btsemm.Strategy {
@@ -291,31 +295,41 @@ type GridLevelStatus struct {
 
 // GridStatus is the JSON representation of the full grid strategy state.
 type GridStatus struct {
-	Grids       int               `json:"grids"`
-	Low         float64           `json:"low"`
-	High        float64           `json:"high"`
-	Ratio       float64           `json:"ratio"`
-	SizePerGrid float64           `json:"sizePerGrid"`
-	MakerFeePct float64           `json:"makerFeePct"`
-	LastMid     float64           `json:"lastMid"`
-	BuyCount    int               `json:"buyCount"`
-	SellCount   int               `json:"sellCount"`
-	Levels      []GridLevelStatus `json:"levels"`
+	Grids           int               `json:"grids"`
+	Low             float64           `json:"low"`
+	High            float64           `json:"high"`
+	Ratio           float64           `json:"ratio"`
+	SizePerGrid     float64           `json:"sizePerGrid"`
+	MakerFeePct     float64           `json:"makerFeePct"`
+	LastMid         float64           `json:"lastMid"`
+	BuyCount        int               `json:"buyCount"`
+	SellCount       int               `json:"sellCount"`
+	TotalProfitUSDT float64           `json:"totalProfitUSDT"`
+	CompletedCycles int               `json:"completedCycles"`
+	ProfitPerCycle  float64           `json:"profitPerCycle"`
+	Levels          []GridLevelStatus `json:"levels"`
 }
 
 // Status implements btsemm.StatusProvider. Returns a GridStatus struct.
 func (s *gridStrategy) Status() interface{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	profitPerCycle := 0.0
+	if s.completedCycles > 0 {
+		profitPerCycle = s.totalProfitUSDT / float64(s.completedCycles)
+	}
 	gs := GridStatus{
-		Grids:       s.grids,
-		Low:         s.low,
-		High:        s.high,
-		Ratio:       s.ratio,
-		SizePerGrid: s.sizePerGrid,
-		MakerFeePct: s.makerFeePct,
-		LastMid:     s.lastMid,
-		Levels:      make([]GridLevelStatus, s.grids),
+		Grids:           s.grids,
+		Low:             s.low,
+		High:            s.high,
+		Ratio:           s.ratio,
+		SizePerGrid:     s.sizePerGrid,
+		MakerFeePct:     s.makerFeePct,
+		LastMid:         s.lastMid,
+		TotalProfitUSDT: s.totalProfitUSDT,
+		CompletedCycles: s.completedCycles,
+		ProfitPerCycle:  profitPerCycle,
+		Levels:          make([]GridLevelStatus, s.grids),
 	}
 	for i := 0; i < s.grids; i++ {
 		side := "BUY"
@@ -365,7 +379,10 @@ func (s *gridStrategy) OnFill(fill btsemm.WSFill) {
 				profit := (s.levels[i+1]/s.levels[i] - 1) * 100
 				netProfit := profit - s.makerFeePct*2
 				netProfitUSDT := s.sizePerGrid * netProfit / 100
-				log.Printf("grid: [%2d] FILLED SELL @ %.6f → now BUY @ %.6f (net profit %.4f%% / $%.4f)", i, fill.Price, s.levels[i], netProfit, netProfitUSDT)
+				s.totalProfitUSDT += netProfitUSDT
+				s.completedCycles++
+				log.Printf("grid: [%2d] FILLED SELL @ %.6f → now BUY @ %.6f (net profit %.4f%% / $%.4f, total $%.4f in %d cycles)",
+					i, fill.Price, s.levels[i], netProfit, netProfitUSDT, s.totalProfitUSDT, s.completedCycles)
 				return
 			}
 		}
