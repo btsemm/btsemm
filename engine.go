@@ -599,10 +599,17 @@ func (e *Engine) reconcileOrders(desired []DesiredOrder, open []*TrackedOrder, b
 			// Place new order
 			log.Printf("engine: placing %s %.6f @ %.6f", d.Side, d.Size, d.Price)
 			if _, err := e.orders.Place(d.Side, d.Price, d.Size, postOnly); err != nil {
-				// Post-only rejections are expected near the spread — don't count as errors
-				if strings.Contains(err.Error(), "post_rejected") {
+				errStr := err.Error()
+				switch {
+				// Post-only rejections are expected near the spread — not errors
+				case strings.Contains(errStr, "post_rejected"):
 					log.Printf("engine: post-only rejected %s @ %.6f (near spread, skipping)", d.Side, d.Price)
-				} else {
+				// Insufficient balance is transient (funds locked in other orders
+				// or consumed by a taker fill). Log a warning but don't count
+				// toward the consecutive error kill threshold.
+				case strings.Contains(errStr, "Insufficient wallet balance"):
+					log.Printf("engine: insufficient balance for %s %.6f @ %.6f (transient, not counting as error)", d.Side, d.Size, d.Price)
+				default:
 					log.Printf("engine: place failed: %v", err)
 					hadError = true
 				}

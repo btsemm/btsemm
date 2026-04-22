@@ -361,31 +361,50 @@ func (s *gridStrategy) OnFill(fill btsemm.WSFill) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Match fill to grid level by price.
-	// Buy orders are placed at levels[i], sell orders at levels[i+1].
+	// Match fill to the closest grid level by price. We scan all grids and
+	// pick the nearest match rather than the first, so taker fills (which
+	// execute at the bid/ask rather than the posted price) still match even
+	// when two adjacent grids are in the same state. Tolerance is one full
+	// grid gap (ratio-1); anything further is genuinely unrelated.
+	tolerance := s.ratio - 1 // e.g. 0.0203 for a 2.03% grid
+	bestIdx := -1
+	bestDist := math.MaxFloat64
+
 	for i := 0; i < s.grids; i++ {
 		if fill.Side == "BUY" && s.state[i] == gridBuy {
-			// Buy order is at levels[i] — match if fill price is close
-			if math.Abs(fill.Price-s.levels[i])/s.levels[i] < 0.001 {
-				s.state[i] = gridSell
-				log.Printf("grid: [%2d] FILLED BUY @ %.6f → now SELL @ %.6f", i, fill.Price, s.levels[i+1])
-				return
+			dist := math.Abs(fill.Price-s.levels[i]) / s.levels[i]
+			if dist < tolerance && dist < bestDist {
+				bestDist = dist
+				bestIdx = i
 			}
 		}
 		if fill.Side == "SELL" && s.state[i] == gridSell {
-			// Sell order is at levels[i+1] — match if fill price is close
-			if math.Abs(fill.Price-s.levels[i+1])/s.levels[i+1] < 0.001 {
-				s.state[i] = gridBuy
-				profit := (s.levels[i+1]/s.levels[i] - 1) * 100
-				netProfit := profit - s.makerFeePct*2
-				netProfitUSDT := s.sizePerGrid * netProfit / 100
-				s.totalProfitUSDT += netProfitUSDT
-				s.completedCycles++
-				log.Printf("grid: [%2d] FILLED SELL @ %.6f → now BUY @ %.6f (net profit %.4f%% / $%.4f, total $%.4f in %d cycles)",
-					i, fill.Price, s.levels[i], netProfit, netProfitUSDT, s.totalProfitUSDT, s.completedCycles)
-				return
+			dist := math.Abs(fill.Price-s.levels[i+1]) / s.levels[i+1]
+			if dist < tolerance && dist < bestDist {
+				bestDist = dist
+				bestIdx = i
 			}
 		}
+	}
+
+	if bestIdx >= 0 {
+		i := bestIdx
+		if fill.Side == "BUY" {
+			s.state[i] = gridSell
+			log.Printf("grid: [%2d] FILLED BUY @ %.6f → now SELL @ %.6f (dev=%.4f%%)",
+				i, fill.Price, s.levels[i+1], bestDist*100)
+			return
+		}
+		// SELL
+		s.state[i] = gridBuy
+		profit := (s.levels[i+1]/s.levels[i] - 1) * 100
+		netProfit := profit - s.makerFeePct*2
+		netProfitUSDT := s.sizePerGrid * netProfit / 100
+		s.totalProfitUSDT += netProfitUSDT
+		s.completedCycles++
+		log.Printf("grid: [%2d] FILLED SELL @ %.6f → now BUY @ %.6f (dev=%.4f%%, net profit %.4f%% / $%.4f, total $%.4f in %d cycles)",
+			i, fill.Price, s.levels[i], bestDist*100, netProfit, netProfitUSDT, s.totalProfitUSDT, s.completedCycles)
+		return
 	}
 
 	log.Printf("grid: FILL %s %.6f @ %.6f (unmatched to grid)", fill.Side, fill.Size, fill.Price)
