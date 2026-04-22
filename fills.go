@@ -68,12 +68,23 @@ type FillHandler struct {
 	// 0.2%) used to estimate fees when the exchange notification doesn't
 	// include them. Set to 0 to disable estimation.
 	DefaultFeeRate float64
+
+	// seenFills tracks the cumulative fillSize already dispatched per
+	// clOrderID. BTSE's notificationApiV2 reports fillSize as a running
+	// total, not an incremental amount. Without deduplication, a partial
+	// fill followed by a full-fill notification double-dispatches the
+	// entire order size.
+	seenFills map[string]float64
 }
 
 // NewFillHandler creates a new FillHandler that only processes events
 // matching the given symbol and order prefix.
 func NewFillHandler(symbol, orderPrefix string) *FillHandler {
-	return &FillHandler{symbol: symbol, orderPrefix: orderPrefix}
+	return &FillHandler{
+		symbol:      symbol,
+		orderPrefix: orderPrefix,
+		seenFills:   make(map[string]float64),
+	}
 }
 
 // OnFill registers a callback that fires for each fill.
@@ -126,32 +137,52 @@ func (fh *FillHandler) Handle(msg WSMessage) {
 		cb(*notif)
 	}
 
-	// If there was a fill, synthesize a WSFill and fire fill callbacks
+	// If there was a fill, compute the INCREMENTAL fill size. BTSE's
+	// notificationApiV2 reports fillSize as a running cumulative total, not
+	// the amount filled in this specific event. Without this delta logic, a
+	// partial fill (status=5) followed by a full-fill (status=4) would
+	// dispatch the entire order size twice — double-counting the position
+	// and matching the wrong grid.
 	if notif.FillSize > 0 {
-		fill := WSFill{
-			OrderID:     notif.OrderID,
-			ClOrderID:   notif.ClOrderID,
-			Symbol:      notif.Symbol,
-			Side:        notif.Side,
-			Price:       notif.AvgFillPrice,
-			Size:        notif.FillSize,
-			Fee:         notif.FeeAmount,
-			FeeCurrency: notif.FeeCurrency,
-			Timestamp:   notif.Timestamp,
-		}
-		if fill.Price == 0 {
-			fill.Price = notif.Price
-		}
-		// If the exchange didn't report a fee, estimate it from the default rate.
-		if fill.Fee == 0 && fh.DefaultFeeRate > 0 {
-			fill.Fee = fill.Size * fill.Price * fh.DefaultFeeRate
-		}
-		if fh.Verbose {
-			log.Printf("fills: dispatching fill %s %.6f @ %.6f to %d callbacks",
-				fill.Side, fill.Size, fill.Price, len(fh.fillCallbacks))
-		}
-		for _, cb := range fh.fillCallbacks {
-			cb(fill)
+		prev := fh.seenFills[notif.ClOrderID]
+		incremental := notif.FillSize - prev
+		if incremental < 1e-12 {
+			// Already dispatched this fill amount — skip. This happens when
+			// BTSE sends a duplicate notification or a status update with the
+			// same cumulative fillSize.
+			if fh.Verbose {
+				log.Printf("fills: skipping duplicate fill for %s (cumulative=%.6f, already dispatched=%.6f)",
+					notif.ClOrderID, notif.FillSize, prev)
+			}
+		} else {
+			fh.seenFills[notif.ClOrderID] = notif.FillSize
+
+			fill := WSFill{
+				OrderID:     notif.OrderID,
+				ClOrderID:   notif.ClOrderID,
+				Symbol:      notif.Symbol,
+				Side:        notif.Side,
+				Price:       notif.AvgFillPrice,
+				Size:        incremental, // delta, not cumulative
+				Fee:         notif.FeeAmount,
+				FeeCurrency: notif.FeeCurrency,
+				Timestamp:   notif.Timestamp,
+			}
+			if fill.Price == 0 {
+				fill.Price = notif.Price
+			}
+			// If the exchange didn't report a fee, estimate from the default rate
+			// using the incremental size.
+			if fill.Fee == 0 && fh.DefaultFeeRate > 0 {
+				fill.Fee = incremental * fill.Price * fh.DefaultFeeRate
+			}
+			if fh.Verbose {
+				log.Printf("fills: dispatching fill %s %.6f @ %.6f (incremental, cumulative=%.6f) to %d callbacks",
+					fill.Side, fill.Size, fill.Price, notif.FillSize, len(fh.fillCallbacks))
+			}
+			for _, cb := range fh.fillCallbacks {
+				cb(fill)
+			}
 		}
 	}
 }

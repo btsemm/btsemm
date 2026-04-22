@@ -364,9 +364,10 @@ func (s *gridStrategy) OnFill(fill btsemm.WSFill) {
 	// Match fill to the closest grid level by price. We scan all grids and
 	// pick the nearest match rather than the first, so taker fills (which
 	// execute at the bid/ask rather than the posted price) still match even
-	// when two adjacent grids are in the same state. Tolerance is one full
-	// grid gap (ratio-1); anything further is genuinely unrelated.
-	tolerance := s.ratio - 1 // e.g. 0.0203 for a 2.03% grid
+	// when two adjacent grids are in the same state. Tolerance is half a
+	// grid gap — wide enough for taker fills, narrow enough to never match
+	// the wrong adjacent grid even when both are in the same state.
+	tolerance := 0.5 * (s.ratio - 1) // e.g. 0.0102 for a 2.03% grid
 	bestIdx := -1
 	bestDist := math.MaxFloat64
 

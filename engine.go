@@ -110,6 +110,12 @@ type Engine struct {
 	lastRiskRejected int
 	lastPrice        float64
 
+	// balanceCooldown: when a placement fails with "Insufficient wallet
+	// balance", we stop retrying new placements until this time. This
+	// prevents hammering the API every tick and escalating into a rate-limit
+	// ban. The cooldown resets when a fill arrives (freeing up funds).
+	balanceCooldown time.Time
+
 	// Watchdog / verbose-mode bookkeeping. Read/written only on the engine
 	// main goroutine (tick + watchdog tickers) except lastFillTime, which is
 	// stored under fillsMu because it's also written from the WS goroutine.
@@ -151,11 +157,14 @@ func NewEngine(client *Client, config EngineConfig, strategy Strategy) *Engine {
 	}
 
 	// Track the time of the most recent fill so the watchdog can report it.
+	// Also clear the balance cooldown — a fill means funds may have been
+	// freed (e.g. a sell fill returns USDT).
 	// Registered last so the position tracker and strategy callbacks already saw the fill.
 	fills.OnFill(func(WSFill) {
 		e.fillsMu.Lock()
 		e.lastFillTime = time.Now()
 		e.fillsMu.Unlock()
+		e.balanceCooldown = time.Time{} // clear cooldown
 	})
 
 	return e
@@ -596,6 +605,12 @@ func (e *Engine) reconcileOrders(desired []DesiredOrder, open []*TrackedOrder, b
 						d.Price, bid, ask)
 				}
 			}
+			// Skip placement during balance cooldown to avoid API spam
+			// that leads to rate-limit bans. Cooldown is cleared when a fill
+			// arrives (see lastFillTime callback in NewEngine).
+			if time.Now().Before(e.balanceCooldown) {
+				continue
+			}
 			// Place new order
 			log.Printf("engine: placing %s %.6f @ %.6f", d.Side, d.Size, d.Price)
 			if _, err := e.orders.Place(d.Side, d.Price, d.Size, postOnly); err != nil {
@@ -604,11 +619,18 @@ func (e *Engine) reconcileOrders(desired []DesiredOrder, open []*TrackedOrder, b
 				// Post-only rejections are expected near the spread — not errors
 				case strings.Contains(errStr, "post_rejected"):
 					log.Printf("engine: post-only rejected %s @ %.6f (near spread, skipping)", d.Side, d.Price)
-				// Insufficient balance is transient (funds locked in other orders
-				// or consumed by a taker fill). Log a warning but don't count
-				// toward the consecutive error kill threshold.
+				// Insufficient balance: set a 30s cooldown to stop retrying.
+				// Without this, 1 balance error/tick × ~3 API calls/tick burns
+				// through BTSE's rate limits in minutes → 24h ban.
 				case strings.Contains(errStr, "Insufficient wallet balance"):
-					log.Printf("engine: insufficient balance for %s %.6f @ %.6f (transient, not counting as error)", d.Side, d.Size, d.Price)
+					log.Printf("engine: insufficient balance for %s %.6f @ %.6f — backing off 30s", d.Side, d.Size, d.Price)
+					e.balanceCooldown = time.Now().Add(30 * time.Second)
+				// Rate-limited: stop all placements for the remainder of this tick.
+				// Don't count toward kill threshold.
+				case strings.Contains(errStr, "rate limited"):
+					log.Printf("engine: rate limited, stopping placements this tick")
+					e.balanceCooldown = time.Now().Add(60 * time.Second)
+					goto doneReconcile
 				default:
 					log.Printf("engine: place failed: %v", err)
 					hadError = true
@@ -619,6 +641,7 @@ func (e *Engine) reconcileOrders(desired []DesiredOrder, open []*TrackedOrder, b
 		}
 	}
 
+doneReconcile:
 	// Cancel unmatched open orders
 	for _, o := range open {
 		if !matched[o.ClOrderID] {
