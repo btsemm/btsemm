@@ -36,8 +36,9 @@ type statusResponse struct {
 	Uptime        string        `json:"uptime"`
 	Config        configStatus  `json:"config"`
 	Market        marketStatus  `json:"market"`
-	Wallet        walletStatus  `json:"wallet"`
-	Position      posStatus     `json:"position"`
+	Wallet        walletStatus       `json:"wallet"`
+	GridPosition  gridPositionStatus `json:"gridPosition"`
+	Position      posStatus          `json:"position"`
 	Risk          riskStatus    `json:"risk"`
 	Engine        engineStatus  `json:"engine"`
 	Orders        ordersStatus  `json:"orders"`
@@ -49,6 +50,13 @@ type walletStatus struct {
 	QuoteTotal float64 `json:"quoteTotal"` // e.g. total USDT on exchange
 	BaseValue  float64 `json:"baseValue"`  // baseTotal * mid
 	TotalValue float64 `json:"totalValue"` // baseTotal * mid + quoteTotal
+}
+
+type gridPositionStatus struct {
+	BaseLocked  float64 `json:"baseLocked"`  // JUNO locked in SELL orders
+	QuoteLocked float64 `json:"quoteLocked"` // USDT locked in BUY orders
+	BaseValue   float64 `json:"baseValue"`   // baseLocked * mid
+	TotalValue  float64 `json:"totalValue"`  // baseLocked * mid + quoteLocked
 }
 
 type configStatus struct {
@@ -144,7 +152,9 @@ func (ws *webServer) buildStatus() statusResponse {
 		return time.Since(t).Truncate(time.Second).String()
 	}
 
-	// Open orders sorted by side then price
+	// Open orders sorted by side then price.
+	// Also compute grid position: JUNO locked in SELLs, USDT locked in BUYs.
+	var gridBaseLocked, gridQuoteLocked float64
 	open := ws.engine.Orders().OpenOrders()
 	sort.Slice(open, func(i, j int) bool {
 		if open[i].Side != open[j].Side {
@@ -154,6 +164,11 @@ func (ws *webServer) buildStatus() statusResponse {
 	})
 	orderList := make([]orderEntry, len(open))
 	for i, o := range open {
+		if o.Side == btsemm.SideBuy {
+			gridQuoteLocked += o.Size * o.Price
+		} else {
+			gridBaseLocked += o.Size
+		}
 		orderList[i] = orderEntry{
 			Side:      string(o.Side),
 			Price:     o.Price,
@@ -189,6 +204,12 @@ func (ws *webServer) buildStatus() statusResponse {
 			MaxConsecErrors:   cfg.MaxConsecErrors,
 		},
 		Market: marketStatus{Mid: mid, Bid: bid, Ask: ask, Spread: spread},
+		GridPosition: gridPositionStatus{
+			BaseLocked:  gridBaseLocked,
+			QuoteLocked: gridQuoteLocked,
+			BaseValue:   gridBaseLocked * mid,
+			TotalValue:  gridBaseLocked*mid + gridQuoteLocked,
+		},
 		Wallet: walletStatus{
 			BaseTotal:  walletBase,
 			QuoteTotal: walletQuote,
@@ -368,7 +389,7 @@ const dashboardHTML = `<!DOCTYPE html>
 <!-- Row 1: Market + Position + Risk + Engine -->
 <div class="row g-2 mb-2">
 
-  <div class="col-6 col-md-3">
+  <div class="col-6 col-lg">
     <div class="card h-100">
       <div class="card-header py-1">Market</div>
       <div class="card-body py-2">
@@ -382,7 +403,21 @@ const dashboardHTML = `<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="col-6 col-md-3">
+  <div class="col-6 col-lg">
+    <div class="card h-100">
+      <div class="card-header py-1">Grid Position</div>
+      <div class="card-body py-2">
+        <h6 id="gpBaseLabel">Base in Grid</h6>
+        <div class="big-val val" id="gpBase">---</div>
+        <h6 class="mt-1" id="gpQuoteLabel">Quote in Grid</h6>
+        <div class="big-val val" id="gpQuote">---</div>
+        <h6 class="mt-1">Total Grid Value</h6>
+        <div class="big-val val" id="gpTotal">---</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-6 col-lg">
     <div class="card h-100">
       <div class="card-header py-1">Wallet</div>
       <div class="card-body py-2">
@@ -400,7 +435,7 @@ const dashboardHTML = `<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="col-6 col-md-3">
+  <div class="col-6 col-lg">
     <div class="card h-100">
       <div class="card-header py-1">Risk</div>
       <div class="card-body py-2">
@@ -415,7 +450,7 @@ const dashboardHTML = `<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="col-6 col-md-3">
+  <div class="col-6 col-lg">
     <div class="card h-100">
       <div class="card-header py-1">Engine</div>
       <div class="card-body py-2">
@@ -515,9 +550,18 @@ function update(d) {
     $('profitPerCycle').textContent = fmt(d.grid.profitPerCycle, 4) + ' USDT';
   }
 
-  // Wallet — real exchange balances
   const base = d.baseCurrency || 'BASE';
   const quote = d.quoteCurrency || 'USDT';
+
+  // Grid Position
+  const gp = d.gridPosition;
+  $('gpBaseLabel').textContent = base + ' in Grid (sells)';
+  $('gpBase').textContent = fmt(gp.baseLocked, 4) + ' ' + base;
+  $('gpQuoteLabel').textContent = quote + ' in Grid (buys)';
+  $('gpQuote').textContent = fmt(gp.quoteLocked, 4) + ' ' + quote;
+  $('gpTotal').textContent = fmt(gp.totalValue, 4) + ' ' + quote;
+
+  // Wallet — real exchange balances
   $('baseLabel').textContent = base;
   $('walletBase').textContent = fmt(d.wallet.baseTotal, 4) + ' ' + base;
   $('quoteLabel').textContent = quote;
