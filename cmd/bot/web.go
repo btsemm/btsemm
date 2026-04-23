@@ -36,11 +36,19 @@ type statusResponse struct {
 	Uptime        string        `json:"uptime"`
 	Config        configStatus  `json:"config"`
 	Market        marketStatus  `json:"market"`
+	Wallet        walletStatus  `json:"wallet"`
 	Position      posStatus     `json:"position"`
 	Risk          riskStatus    `json:"risk"`
 	Engine        engineStatus  `json:"engine"`
 	Orders        ordersStatus  `json:"orders"`
 	Grid          interface{}   `json:"grid,omitempty"`
+}
+
+type walletStatus struct {
+	BaseTotal  float64 `json:"baseTotal"`  // e.g. total JUNO on exchange
+	QuoteTotal float64 `json:"quoteTotal"` // e.g. total USDT on exchange
+	BaseValue  float64 `json:"baseValue"`  // baseTotal * mid
+	TotalValue float64 `json:"totalValue"` // baseTotal * mid + quoteTotal
 }
 
 type configStatus struct {
@@ -161,6 +169,8 @@ func (ws *webServer) buildStatus() statusResponse {
 		uptime = time.Since(t).Truncate(time.Second).String()
 	}
 
+	walletBase, walletQuote := ws.engine.WalletSnapshot()
+
 	resp := statusResponse{
 		Symbol:        cfg.Symbol,
 		BaseCurrency:  base,
@@ -179,6 +189,12 @@ func (ws *webServer) buildStatus() statusResponse {
 			MaxConsecErrors:   cfg.MaxConsecErrors,
 		},
 		Market: marketStatus{Mid: mid, Bid: bid, Ask: ask, Spread: spread},
+		Wallet: walletStatus{
+			BaseTotal:  walletBase,
+			QuoteTotal: walletQuote,
+			BaseValue:  walletBase * mid,
+			TotalValue: walletBase*mid + walletQuote,
+		},
 		Position: posStatus{
 			BaseQty:        pos.BaseQty,
 			QuoteSpent:     pos.QuoteSpent,
@@ -368,17 +384,18 @@ const dashboardHTML = `<!DOCTYPE html>
 
   <div class="col-6 col-md-3">
     <div class="card h-100">
-      <div class="card-header py-1">Position</div>
+      <div class="card-header py-1">Wallet</div>
       <div class="card-body py-2">
         <h6 id="baseLabel">Base</h6>
-        <div class="big-val val" id="baseQty">---</div>
-        <h6 class="mt-1" id="baseValueLabel">Value</h6>
-        <span class="val" id="baseValue">---</span>
-        <div class="row mt-1">
-          <div class="col-6"><h6>Avg Cost</h6><span class="val" id="avgCost">---</span></div>
+        <div class="big-val val" id="walletBase">---</div>
+        <h6 class="mt-1" id="quoteLabel">Quote</h6>
+        <div class="big-val val" id="walletQuote">---</div>
+        <h6 class="mt-1">Total Value</h6>
+        <div class="big-val val" id="walletTotal">---</div>
+        <div class="row mt-1" style="font-size:0.75rem">
           <div class="col-6"><h6>Fills</h6><span class="val" id="fillCount">---</span></div>
+          <div class="col-6"><h6>Bot Delta</h6><span class="val" id="baseQty">---</span></div>
         </div>
-        <h6 class="mt-1">Net Quote Flow</h6><span class="val" id="quoteSpent">---</span>
       </div>
     </div>
   </div>
@@ -498,16 +515,16 @@ function update(d) {
     $('profitPerCycle').textContent = fmt(d.grid.profitPerCycle, 4) + ' USDT';
   }
 
-  // Position — with currency labels
+  // Wallet — real exchange balances
   const base = d.baseCurrency || 'BASE';
   const quote = d.quoteCurrency || 'USDT';
   $('baseLabel').textContent = base;
-  $('baseQty').textContent = fmt(d.position.baseQty, 4) + ' ' + base;
-  $('baseValueLabel').textContent = 'Value in ' + quote;
-  $('baseValue').textContent = fmt(d.position.inventoryValue, 4) + ' ' + quote;
-  $('avgCost').textContent = fmt(d.position.avgCost);
+  $('walletBase').textContent = fmt(d.wallet.baseTotal, 4) + ' ' + base;
+  $('quoteLabel').textContent = quote;
+  $('walletQuote').textContent = fmt(d.wallet.quoteTotal, 4) + ' ' + quote;
+  $('walletTotal').textContent = fmt(d.wallet.totalValue, 4) + ' ' + quote;
   $('fillCount').textContent = d.position.fillCount;
-  $('quoteSpent').textContent = fmt(d.position.quoteSpent, 4) + ' ' + quote;
+  $('baseQty').textContent = (d.position.baseQty >= 0 ? '+' : '') + fmt(d.position.baseQty, 4);
 
   // Risk
   const killed = d.risk.killed;

@@ -116,6 +116,12 @@ type Engine struct {
 	// ban. The cooldown resets when a fill arrives (freeing up funds).
 	balanceCooldown time.Time
 
+	// Wallet balances — refreshed every reconcile interval (30s). Read from
+	// the web handler via WalletSnapshot(), written on the engine goroutine.
+	walletMu   sync.RWMutex
+	walletBase float64 // e.g. JUNO total
+	walletQuot float64 // e.g. USDT total
+
 	// Watchdog / verbose-mode bookkeeping. Read/written only on the engine
 	// main goroutine (tick + watchdog tickers) except lastFillTime, which is
 	// stored under fillsMu because it's also written from the WS goroutine.
@@ -400,10 +406,11 @@ func (e *Engine) Run(ctx context.Context) error {
 	log.Printf("engine: amend_bps=%.1f (at current price %.6f = threshold %.6f)",
 		amendBPS, e.lastPrice, e.lastPrice*(amendBPS/10000.0))
 
-	// Initial reconcile
+	// Initial reconcile + wallet snapshot
 	if err := e.orders.Reconcile(); err != nil {
 		log.Printf("engine: initial reconcile: %v", err)
 	}
+	e.refreshWallet()
 
 	// Main loop
 	tickInterval := e.config.TickInterval
@@ -456,6 +463,7 @@ func (e *Engine) Run(ctx context.Context) error {
 				log.Printf("engine: periodic reconcile: %v", err)
 			}
 			e.orders.Cleanup(5 * time.Minute)
+			e.refreshWallet()
 
 		case <-watchdogCh:
 			e.watchdog()
@@ -776,6 +784,52 @@ func (e *Engine) StrategyRaw() Strategy { return e.strategy }
 
 // Market returns the validated market parameters from preflight.
 func (e *Engine) Market() MarketInfo { return e.market }
+
+// WalletSnapshot returns the most recently fetched wallet balances for the
+// base and quote currencies. Updated every reconcile interval.
+func (e *Engine) WalletSnapshot() (base, quote float64) {
+	e.walletMu.RLock()
+	defer e.walletMu.RUnlock()
+	return e.walletBase, e.walletQuot
+}
+
+// refreshWallet fetches the current wallet balances from the exchange.
+func (e *Engine) refreshWallet() {
+	parts := strings.SplitN(e.config.Symbol, "-", 2)
+	if len(parts) != 2 {
+		return
+	}
+	baseCcy, quoteCcy := parts[0], parts[1]
+
+	baseBal, err := e.client.GetCurrencyBalance(baseCcy)
+	if err != nil {
+		if e.config.Verbose {
+			log.Printf("engine: wallet refresh %s: %v", baseCcy, err)
+		}
+		return
+	}
+	quoteBal, err := e.client.GetCurrencyBalance(quoteCcy)
+	if err != nil {
+		if e.config.Verbose {
+			log.Printf("engine: wallet refresh %s: %v", quoteCcy, err)
+		}
+		return
+	}
+
+	baseTotal := 0.0
+	if baseBal != nil {
+		baseTotal = baseBal.Total
+	}
+	quoteTotal := 0.0
+	if quoteBal != nil {
+		quoteTotal = quoteBal.Total
+	}
+
+	e.walletMu.Lock()
+	e.walletBase = baseTotal
+	e.walletQuot = quoteTotal
+	e.walletMu.Unlock()
+}
 
 // StartedAt is set when Run begins. Zero value means not started yet.
 func (e *Engine) StartedAt() time.Time { return e.startedAt }
